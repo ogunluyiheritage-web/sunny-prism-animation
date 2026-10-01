@@ -1,0 +1,634 @@
+'use client'
+
+import React, { useEffect, useMemo, useRef } from 'react'
+import { useFrame } from '@react-three/fiber'
+import { useTexture } from '@react-three/drei'
+import * as THREE from 'three'
+
+import {
+  buildPyramid,
+  buildSlices,
+  buildSectionOutline,
+  buildCutSweep,
+  buildCutSweepGeometry,
+  buildCutSweepOutline,
+  sectionHalfExtent,
+  CUT_SWEEP_SAMPLES,
+  K_MAX,
+  K_MIN,
+} from '@/lib/prismGeometry'
+
+import {
+  getStages,
+  sliceOffset,
+  sliceTilt,
+  prismYaw,
+  prismPitch,
+  shellOpacity,  prismRecede,
+  PRISM_SHAPE,
+  PRISM_ORIENTATION_Z,
+  easeInOutCubic,
+  easeOutCubic,
+  easeInOutSine,
+  lerp,
+  clamp01,
+  range,
+} from '@/lib/timeline'
+
+const COLOR_SECTION = new THREE.Color('#B48CFF')
+const COLOR_CUT = new THREE.Color('#9B5CFF')
+const COLOR_FILL = new THREE.Color('#8B5CFF')
+const COLOR_FILL_EDGE = new THREE.Color('#E0D0FF')
+const COLOR_BASE = new THREE.Color('#3DCC6E')
+const RING_INFLATE = 1.012
+const SECTION_PAD = 0.012
+/* How brightly the shell's own edges are drawn while it is glass. */
+const EDGE_GLASS = 0.55
+const EDGE_IDLE = 0
+const EDGE_LIT = 0.5
+const EDGE_SETTLED = 0.65
+const MATCAP_URL = '/matcap.png'
+const MATCAP_SOFT_URL = '/matcap-soft.png'
+const SOFT_GAIN = 2.65
+const SOFT_SATURATION = 0.5
+const MATCAP_DETAIL = 1.55
+const DEPTH_OFFSET_OUTER = 2
+const DEPTH_OFFSET_INTERIOR = 6
+
+// CUT-stage reference geometry: the front silhouette is split along the
+// apex-to-base-midline into two real triangular pieces. Keeping these as
+// explicit triangles (instead of a rectangular section plane) matches the
+// buyer's reference when the prism turns to apex-left / base-right.
+function buildCutTriangleGeometry(side) {
+  const x = side < 0 ? -1 : 1
+  const gap = 0.025
+  const mid = x < 0 ? -gap : gap
+  const outer = x
+  const positions = new Float32Array([
+    0, 1, 0.055,
+    mid, -1, 0.055,
+    outer, -1, 0.055,
+  ])
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setIndex([0, 1, 2])
+  geometry.computeVertexNormals()
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 2)
+  return geometry
+}
+
+function buildCutTriangleEdgeGeometry(side) {
+  const x = side < 0 ? -1 : 1
+  const gap = 0.025
+  const mid = x < 0 ? -gap : gap
+  const outer = x
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute(
+    'position',
+    new THREE.BufferAttribute(
+      new Float32Array([
+        0, 1, 0.062, mid, -1, 0.062,
+        mid, -1, 0.062, outer, -1, 0.062,
+        outer, -1, 0.062, 0, 1, 0.062,
+      ]),
+      3
+    )
+  )
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 2)
+  return geometry
+}
+
+
+function buildCutBaseEdgeGeometry() {
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute(
+    'position',
+    new THREE.BufferAttribute(
+      new Float32Array([-1, -1, 0.067, 1, -1, 0.067]),
+      3
+    )
+  )
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 2)
+  return geometry
+}
+
+function toSRGB(texture) {
+  texture.colorSpace = THREE.SRGBColorSpace
+  texture.needsUpdate = true
+}
+
+function toSoftSRGB(texture) {
+  texture.colorSpace = THREE.SRGBColorSpace
+  texture.generateMipmaps = false
+  texture.minFilter = THREE.LinearFilter
+  texture.magFilter = THREE.LinearFilter
+  texture.needsUpdate = true
+}
+
+function createPrismMaterial(matcap, matcapSoft, depthOffset) {
+  const material = new THREE.MeshMatcapMaterial({
+    matcap,
+    side: THREE.FrontSide,
+    polygonOffset: true,
+    polygonOffsetFactor: depthOffset,
+    polygonOffsetUnits: depthOffset,
+  })
+  material.onBeforeCompile = (shader) => {
+    const sample = 'vec4 matcapColor = texture2D( matcap, uv );'
+    if (!shader.fragmentShader.includes(sample)) return
+    shader.uniforms.matcapSoft = { value: matcapSoft }
+    shader.uniforms.softGain = { value: SOFT_GAIN }
+    shader.uniforms.softSaturation = { value: SOFT_SATURATION }
+    shader.uniforms.matcapDetail = { value: MATCAP_DETAIL }
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>\nuniform sampler2D matcapSoft;\nuniform float softGain;\nuniform float softSaturation;\nuniform float matcapDetail;`
+      )
+      .replace(
+        sample,
+        `${sample}\n\t\tvec3 softColor = texture2D( matcapSoft, uv ).rgb;\n\t\tfloat softLuma = dot( softColor, vec3( 0.2126, 0.7152, 0.0722 ) );\n\t\tvec3 silver = min( mix( vec3( softLuma ), softColor, softSaturation ) * softGain, vec3( 1.0 ) );\n\t\tmatcapColor.rgb = 1.0 - ( 1.0 - silver ) * ( 1.0 - min( matcapColor.rgb * matcapDetail, vec3( 1.0 ) ) );`
+      )
+  }
+  material.customProgramCacheKey = () => 'prism-silver-matcap'
+  return material
+}
+
+export default function PrismObject({ controllerRef, composition, reducedMotion }) {
+  const matcap = useTexture(MATCAP_URL, toSRGB)
+  const matcapSoft = useTexture(MATCAP_SOFT_URL, toSoftSRGB)
+  const prismMaterials = useMemo(
+    () => [
+      createPrismMaterial(matcap, matcapSoft, DEPTH_OFFSET_OUTER),
+      createPrismMaterial(matcap, matcapSoft, DEPTH_OFFSET_INTERIOR),
+    ],
+    [matcap, matcapSoft]
+  )
+  useEffect(() => () => prismMaterials.forEach((m) => m.dispose()), [prismMaterials])
+
+  const groupRef = useRef(null)
+  const sliceRefs = useRef([])
+  const sliceMeshRefs = useRef([])
+  const edgeMaterialRefs = useRef([])
+  const sectionRefs = useRef([])
+  const cutRef = useRef(null)
+  const cutEdgeRef = useRef(null)
+  const fillPlaneRef = useRef(null)
+  const fillOutlineRef = useRef(null)
+  const fillBaseRef = useRef(null)
+  const cutTriangleRefs = useRef([])
+  const cutTriangleEdgeRefs = useRef([])
+  const cutBaseEdgeRef = useRef(null)
+
+  const slices = useMemo(() => buildSlices(), [])
+  const sectionOutline = useMemo(() => buildSectionOutline(), [])
+  const cutSweep = useMemo(() => buildCutSweep(), [])
+  const cutGeo = useMemo(() => buildCutSweepGeometry(), [])
+  const cutEdgeGeo = useMemo(() => buildCutSweepOutline(), [])
+  const sliceEdges = useMemo(() => slices.map((s) => new THREE.EdgesGeometry(s.geometry, 15)), [slices])
+  // Edges of the WHOLE solid. While the shell is glass only the uncut
+  // pyramid's own edges are drawn, as the diagrams do; the per-slice seams stay
+  // dark until the cutting plane actually reaches them, which is what keeps the
+  // travelling section reading as one unbroken face.
+  const shellEdges = useMemo(() => {
+    const pyramid = buildPyramid()
+    const edges = new THREE.EdgesGeometry(pyramid, 15)
+    pyramid.dispose()
+    return edges
+  }, [])
+  const shellEdgeRef = useRef(null)
+
+  const fillPlaneGeo = useMemo(() => {
+    const g = new THREE.PlaneGeometry(2, 2)
+    g.rotateX(-Math.PI / 2)
+    return g
+  }, [])
+  const cutTriangleGeometries = useMemo(() => [-1, 1].map(buildCutTriangleGeometry), [])
+  const cutTriangleEdgeGeometries = useMemo(() => [-1, 1].map(buildCutTriangleEdgeGeometry), [])
+  const cutBaseEdgeGeometry = useMemo(() => buildCutBaseEdgeGeometry(), [])
+
+  const fillOutlineGeo = useMemo(() => {
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(5 * 3), 3))
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 3)
+    return g
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      slices.forEach((s) => s.geometry.dispose())
+      sliceEdges.forEach((e) => e.dispose())
+      sectionOutline.dispose()
+      cutGeo.dispose()
+      cutEdgeGeo.dispose()
+      fillPlaneGeo.dispose()
+      fillOutlineGeo.dispose()
+      cutTriangleGeometries.forEach((g) => g.dispose())
+      cutTriangleEdgeGeometries.forEach((g) => g.dispose())
+      cutBaseEdgeGeometry.dispose()
+    }
+  }, [slices, sliceEdges, sectionOutline, cutGeo, cutEdgeGeo, fillPlaneGeo, fillOutlineGeo, cutTriangleGeometries, cutTriangleEdgeGeometries, cutBaseEdgeGeometry])
+
+  const scratch = useMemo(() => ({ offset: new THREE.Vector3() }), [])
+
+  useFrame((state) => {
+    const controller = controllerRef.current
+    const units = controller.stage.units
+    const s = getStages(units)
+    const time = state.clock.elapsedTime
+    const idle = reducedMotion ? 0 : 1
+    const settleAmount = easeInOutCubic(s.settle)
+    const spread = easeInOutSine(s.explode) * composition.explodeScale
+
+    if (groupRef.current) {
+      const heroSpin = (1 - easeInOutSine(range(units, 0.0, 1.2))) * idle
+      const sway = (1 - easeInOutSine(s.section) * 0.55) * idle
+
+      groupRef.current.rotation.y =
+        prismYaw(units) +
+        time * 0.22 * heroSpin +
+        (controller.pointer.x * 0.08 * composition.pointerStrength +
+          Math.sin(time * 0.35) * 0.08) *
+          sway
+
+      groupRef.current.rotation.x =
+        prismPitch(units) +
+        (controller.pointer.y * 0.05 * composition.pointerStrength +
+          Math.sin(time * 0.42) * 0.035) *
+          sway
+      // Keep the hero and section chapters in their original upright orientation.
+      // The buyer's left-point / right-base orientation only begins when the
+      // CUT chapter starts, then settles at 90° while the cut pieces open.
+      const cutOrientation = easeInOutSine(range(units, 2.0, 2.45))
+      groupRef.current.rotation.z = PRISM_ORIENTATION_Z * cutOrientation
+
+      const recede = prismRecede(units)
+      const breathe = 1 + Math.sin(time * 0.55) * 0.008 * idle
+      const scale = controller.stage.scale * breathe * lerp(1, 0.58, recede)
+      groupRef.current.scale.set(
+        PRISM_SHAPE[0] * scale,
+        PRISM_SHAPE[1] * scale,
+        PRISM_SHAPE[2] * scale
+      )
+      groupRef.current.position.set(
+        lerp(0, -1.9, recede) * controller.stage.scale,
+        lerp(0, 0.25, recede) * controller.stage.scale,
+        lerp(0, -1.1, recede) * controller.stage.scale
+      )
+    }
+
+    const sweepT = easeInOutCubic(s.reveal)
+    const sweepK = lerp(K_MAX - 0.02, K_MIN + 0.02, sweepT)
+    const sweepFade =
+      easeOutCubic(range(sweepT, 0, 0.12)) *
+      (1 - easeInOutSine(range(sweepT, 0.82, 1)))
+
+    // Rectangular purple section travels apex → base (Sunny gif2).
+    const sectionIn = easeOutCubic(range(s.section, 0, 0.08))
+    const scanT = easeInOutSine(s.section)
+    const scanY = lerp(0.95, -0.95, scanT)
+    const half = sectionHalfExtent(scanY)
+    const planeFade = sectionIn * (1 - easeInOutSine(range(units, 1.75, 2.05)))
+    const edgeDim = lerp(1, EDGE_SETTLED, settleAmount)
+
+    // See-through silver so the purple rectangle reads through. One schedule
+    // for it (shellOpacity), which also keeps the shell glassy through the cut
+    // chapter, where the cutting plane has to be visible inside the solid too.
+    const shell = shellOpacity(units)
+    // Fully lit shell edges where the shell is at its most transparent.
+    const glassEdge = clamp01((0.97 - shell) / 0.5)
+    const solidFade = lerp(1, 0.1, prismRecede(units)) * shell
+    const firstMesh = sliceMeshRefs.current[0]
+    if (firstMesh) {
+      const materials = firstMesh.material
+      for (let m = 0; m < materials.length; m++) {
+        materials[m].transparent = solidFade < 0.995
+        materials[m].opacity = solidFade
+        materials[m].depthWrite = solidFade > 0.995
+      }
+    }
+
+    // The uncut solid's own edges, drawn while the shell is glass. They stop
+    // as the pieces start to move, when each slice's own seams take over.
+    const shellEdge = shellEdgeRef.current
+    if (shellEdge) {
+      const drawn = glassEdge * (1 - easeInOutSine(range(units, 2.2, 2.6)))
+      shellEdge.visible = drawn > 0.004
+      if (shellEdge.visible) shellEdge.material.opacity = EDGE_GLASS * drawn
+    }
+
+    // Filled section plane + outline + green base
+    if (fillPlaneRef.current) {
+      const show = planeFade > 0.01
+      fillPlaneRef.current.visible = show
+      if (show) {
+        fillPlaneRef.current.position.set(0, scanY, 0)
+        fillPlaneRef.current.scale.set(half, 1, half)
+        fillPlaneRef.current.material.opacity = 0.9 * planeFade
+      }
+    }
+    if (fillOutlineRef.current) {
+      const show = planeFade > 0.01
+      fillOutlineRef.current.visible = show
+      if (show) {
+        // Reached through the mesh rather than through the memoized geometry:
+        // React's compiler holds a value created in a hook immutable, and the
+        // frame loop has to write these corners every frame.
+        const a = fillOutlineRef.current.geometry.attributes.position.array
+        const corners = [
+          [-half, scanY, -half],
+          [half, scanY, -half],
+          [half, scanY, half],
+          [-half, scanY, half],
+          [-half, scanY, -half],
+        ]
+        for (let i = 0; i < 5; i++) {
+          a[i * 3] = corners[i][0]
+          a[i * 3 + 1] = corners[i][1]
+          a[i * 3 + 2] = corners[i][2]
+        }
+        fillOutlineRef.current.geometry.attributes.position.needsUpdate = true
+        fillOutlineRef.current.material.opacity = 1.0 * planeFade
+      }
+    }
+    if (fillBaseRef.current) {
+      const show = planeFade > 0.01
+      fillBaseRef.current.visible = show
+      if (show) {
+        fillBaseRef.current.position.set(0, -0.98, 0)
+        fillBaseRef.current.material.opacity = 0.75 * planeFade
+      }
+    }
+
+    // CUT reference pieces: fade the old rectangular scan out as the cut
+    // starts, then reveal two genuine triangular purple faces. The pair shares
+    // the apex-to-base-midline seam; the outer/base edge is picked out in green.
+    const cutPiecesIn = easeInOutSine(range(units, 1.95, 2.35))
+    const cutPiecesOut = 1 - easeInOutSine(range(units, 3.0, 3.35))
+    const cutPiecesOpacity = cutPiecesIn * cutPiecesOut
+    for (let i = 0; i < 2; i++) {
+      const tri = cutTriangleRefs.current[i]
+      const edge = cutTriangleEdgeRefs.current[i]
+      if (tri) {
+        tri.visible = cutPiecesOpacity > 0.004
+        tri.material.opacity = 0.72 * cutPiecesOpacity
+      }
+      if (edge) {
+        edge.visible = cutPiecesOpacity > 0.004
+        edge.material.opacity = 0.9 * cutPiecesOpacity
+      }
+    }
+    const cutBaseEdge = cutBaseEdgeRef.current
+    if (cutBaseEdge) {
+      cutBaseEdge.visible = cutPiecesOpacity > 0.004
+      cutBaseEdge.material.opacity = 0.95 * cutPiecesOpacity
+    }
+
+    for (let i = 0; i < slices.length; i++) {
+      const slice = slices[i]
+      const group = sliceRefs.current[i]
+      if (group) {
+        sliceOffset(i, spread, scratch.offset)
+        group.position.copy(scratch.offset)
+        group.rotation.z = sliceTilt(i, spread)
+      }
+      const edgeMaterial = edgeMaterialRefs.current[i]
+      if (edgeMaterial) {
+        const lit = clamp01((K_MAX - sweepK) / (K_MAX - slice.kLow))
+        edgeMaterial.opacity =
+          lerp(EDGE_IDLE, EDGE_LIT, easeOutCubic(lit)) * edgeDim * solidFade
+      }
+      const section = sectionRefs.current[i]
+      if (section) {
+        const x0 = Math.max(-half, (slice.kLow - scanY) / 2)
+        const x1 = Math.min(half, (slice.kHigh - scanY) / 2)
+        const visible = planeFade > 0.004 && x1 - x0 > 0.002
+        section.visible = visible
+        if (visible) {
+          section.position.set((x0 + x1) / 2, scanY, 0)
+          section.scale.set((x1 - x0) / 2 + SECTION_PAD, 1, half + SECTION_PAD)
+          section.material.opacity = 0.95 * planeFade
+        }
+      }
+    }
+
+    if (cutRef.current && cutEdgeRef.current) {
+      const visible = sweepFade > 0.004
+      cutRef.current.visible = visible
+      cutEdgeRef.current.visible = visible
+      if (visible) {
+        const fIndex = sweepT * (cutSweep.count - 1)
+        const i0 = Math.floor(fIndex)
+        const i1 = Math.min(i0 + 1, cutSweep.count - 1)
+        const mix = fIndex - i0
+        const a = cutSweep.steps[i0]
+        const b = cutSweep.steps[i1]
+        const posAttr = cutRef.current.geometry.attributes.position
+        const edgeAttr = cutEdgeRef.current.geometry.attributes.position
+        const pos = posAttr.array
+        const edge = edgeAttr.array
+        let cx = 0, cy = 0, cz = 0
+        for (let v = 0; v < CUT_SWEEP_SAMPLES; v++) {
+          const x = lerp(a[v * 3], b[v * 3], mix)
+          const y = lerp(a[v * 3 + 1], b[v * 3 + 1], mix)
+          const z = lerp(a[v * 3 + 2], b[v * 3 + 2], mix)
+          pos[v * 3] = x
+          pos[v * 3 + 1] = y
+          pos[v * 3 + 2] = z
+          cx += x; cy += y; cz += z
+        }
+        cx /= CUT_SWEEP_SAMPLES; cy /= CUT_SWEEP_SAMPLES; cz /= CUT_SWEEP_SAMPLES
+        for (let v = 0; v < CUT_SWEEP_SAMPLES; v++) {
+          edge[v * 3] = cx + (pos[v * 3] - cx) * RING_INFLATE
+          edge[v * 3 + 1] = cy + (pos[v * 3 + 1] - cy) * RING_INFLATE
+          edge[v * 3 + 2] = cz + (pos[v * 3 + 2] - cz) * RING_INFLATE
+        }
+        edge[CUT_SWEEP_SAMPLES * 3] = edge[0]
+        edge[CUT_SWEEP_SAMPLES * 3 + 1] = edge[1]
+        edge[CUT_SWEEP_SAMPLES * 3 + 2] = edge[2]
+        posAttr.needsUpdate = true
+        edgeAttr.needsUpdate = true
+        cutRef.current.material.opacity = 0.22 * sweepFade
+        cutEdgeRef.current.material.opacity = 0.9 * sweepFade
+      }
+    }
+  })
+
+  return (
+    <group ref={groupRef}>
+      {/* The uncut solid's edges, drawn while the shell is glass. */}
+      <lineSegments
+        ref={shellEdgeRef}
+        geometry={shellEdges}
+        renderOrder={10}
+        visible={false}
+        frustumCulled={false}
+      >
+        <lineBasicMaterial
+          color="#E4DEFF"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </lineSegments>
+
+      {slices.map((slice, i) => (
+        <group key={i} ref={(el) => { sliceRefs.current[i] = el }}>
+          <mesh
+            ref={(el) => { sliceMeshRefs.current[i] = el }}
+            geometry={slice.geometry}
+            material={prismMaterials}
+            renderOrder={0}
+          />
+          <lineSegments geometry={sliceEdges[i]} renderOrder={1}>
+            <lineBasicMaterial
+              ref={(el) => { edgeMaterialRefs.current[i] = el }}
+              color="#CFC8FF"
+              transparent
+              opacity={EDGE_IDLE}
+              depthWrite={false}
+              toneMapped={false}
+            />
+          </lineSegments>
+          <lineLoop
+            ref={(el) => { sectionRefs.current[i] = el }}
+            geometry={sectionOutline}
+            renderOrder={12}
+            visible={false}
+            frustumCulled={false}
+          >
+            <lineBasicMaterial
+              color={COLOR_SECTION}
+              transparent
+              opacity={0}
+              depthWrite={false}
+              depthTest={true}
+              blending={THREE.AdditiveBlending}
+              toneMapped={false}
+            />
+          </lineLoop>
+        </group>
+      ))}
+
+      {/* CUT stage: two true triangular pieces split at the apex-to-base
+          midline. These replace the rectangular purple panel at the moment
+          the buyer's left-point / right-base orientation begins. */}
+      {cutTriangleGeometries.map((geometry, i) => (
+        <mesh
+          key={`cut-triangle-${i}`}
+          ref={(el) => { cutTriangleRefs.current[i] = el }}
+          geometry={geometry}
+          renderOrder={22}
+          visible={false}
+          frustumCulled={false}
+        >
+          <meshBasicMaterial
+            color={COLOR_FILL}
+            transparent
+            opacity={0}
+            side={THREE.DoubleSide}
+            depthWrite={false}
+            depthTest={false}
+            toneMapped={false}
+          />
+        </mesh>
+      ))}
+      {cutTriangleEdgeGeometries.map((geometry, i) => (
+        <lineSegments
+          key={`cut-triangle-edge-${i}`}
+          ref={(el) => { cutTriangleEdgeRefs.current[i] = el }}
+          geometry={geometry}
+          renderOrder={23}
+          visible={false}
+          frustumCulled={false}
+        >
+          <lineBasicMaterial
+            color="#A996FF"
+            transparent
+            opacity={0}
+            depthWrite={false}
+            toneMapped={false}
+          />
+        </lineSegments>
+      ))}
+
+      <lineSegments
+        ref={cutBaseEdgeRef}
+        geometry={cutBaseEdgeGeometry}
+        renderOrder={24}
+        visible={false}
+        frustumCulled={false}
+      >
+        <lineBasicMaterial
+          color={COLOR_BASE}
+          transparent
+          opacity={0}
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </lineSegments>
+
+      {/* Filled rectangular section: apex → base (Sunny gif2) */}
+      <mesh ref={fillPlaneRef} geometry={fillPlaneGeo} renderOrder={20} visible={false} frustumCulled={false}>
+        <meshBasicMaterial
+          color={COLOR_FILL}
+          transparent
+          opacity={0}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+          depthTest={false}
+          toneMapped={false}
+        />
+      </mesh>
+      <line ref={fillOutlineRef} geometry={fillOutlineGeo} renderOrder={21} visible={false} frustumCulled={false}>
+        <lineBasicMaterial
+          color={COLOR_FILL_EDGE}
+          transparent
+          opacity={0}
+          depthWrite={false}
+          depthTest={false}
+          toneMapped={false}
+        />
+      </line>
+      <mesh ref={fillBaseRef} geometry={fillPlaneGeo} renderOrder={19} visible={false} frustumCulled={false}>
+        <meshBasicMaterial
+          color={COLOR_BASE}
+          transparent
+          opacity={0}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+          depthTest={false}
+          toneMapped={false}
+        />
+      </mesh>
+
+      <mesh ref={cutRef} geometry={cutGeo} renderOrder={13} visible={false} frustumCulled={false}>
+        <meshBasicMaterial
+          color={COLOR_CUT}
+          transparent
+          opacity={0}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+          depthTest={true}
+          blending={THREE.AdditiveBlending}
+          toneMapped={false}
+        />
+      </mesh>
+      <lineLoop ref={cutEdgeRef} geometry={cutEdgeGeo} renderOrder={14} visible={false} frustumCulled={false}>
+        <lineBasicMaterial
+          color={COLOR_CUT}
+          transparent
+          opacity={0}
+          depthWrite={false}
+          depthTest={true}
+          blending={THREE.AdditiveBlending}
+          toneMapped={false}
+        />
+      </lineLoop>
+    </group>
+  )
+}
+
+useTexture.preload(MATCAP_URL)
+useTexture.preload(MATCAP_SOFT_URL)

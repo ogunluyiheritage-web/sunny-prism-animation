@@ -1,0 +1,643 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens, sampled from Sunny's design reference
+ * (references/screenshots/pptx/image1.png, 1761px wide).
+ */
+:root {
+  --bg: #0f021f;
+  --text: #ffffff;
+  --text-muted: #b1b4c0;
+  --accent-gradient: linear-gradient(90deg, #9856ff 0%, #01f4b1 100%);
+  --cta-gradient: linear-gradient(90deg, #ff7701 0%, #24dddb 100%);
+  --pad: clamp(22px, 6vw, 56px);
+  --font-sans: "Manrope Variable";
+}
+
+/* The background is painted by CSS before WebGL initialises, so there is never
+   a white first paint. */
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+}
+
+.prism-page {
+  position: relative;
+  background: var(--bg);
+}
+
+/* ── Fixed stage ───────────────────────────────────────────────────────────
+   The prism and its light stay on screen while the chapters scroll over them.
+   Each chapter says where the prism should sit (--px / --py / --ph). */
+
+.prism-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: var(--bg);
+  container-type: inline-size;
+  --col: calc(100cqw / 11);
+}
+
+.hero-bg,
+.hero-webgl {
+  position: absolute;
+  inset: 0;
+}
+
+.hero-bg {
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* pan-y lets a touch drag scroll the page straight through the canvas. */
+.hero-webgl {
+  z-index: 1;
+  touch-action: pan-y;
+}
+
+.hero-webgl canvas {
+  display: block;
+  touch-action: pan-y;
+}
+
+/* Background light, positioned every frame by the prism rig with
+   transform/opacity only. Each is a 100px box scaled to size. */
+
+.hero-aura {
+  position: absolute;
+  inset: -20%;
+  background:
+    radial-gradient(38% 42% at 68% 46%, rgba(92, 60, 220, 0.3), transparent 72%),
+    radial-gradient(30% 32% at 82% 78%, rgba(40, 96, 230, 0.16), transparent 72%);
+  opacity: 0.8;
+  will-change: transform, opacity;
+}
+
+.hero-glow,
+.hero-pool {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  opacity: 0;
+  transform-origin: 50% 50%;
+  will-change: transform, opacity;
+}
+
+.hero-glow {
+  background: radial-gradient(
+    closest-side,
+    rgba(128, 96, 255, 0.42),
+    rgba(80, 64, 220, 0.16) 50%,
+    transparent 100%
+  );
+}
+
+.hero-pool {
+  background: radial-gradient(
+    closest-side,
+    rgba(110, 150, 255, 0.5),
+    rgba(100, 90, 255, 0.16) 55%,
+    transparent 100%
+  );
+}
+
+/* ── Band labels ───────────────────────────────────────────────────────────
+   Page text, not sprites, so it stays crisp at any zoom. ShadowBands positions
+   each label over its band every frame with transform and opacity only; above
+   the canvas, below the chapter copy. */
+
+.band-labels {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.band-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  opacity: 0;
+  font-size: clamp(9px, 0.78cqw, 13px);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: rgba(226, 219, 255, 0.92);
+  text-shadow: 0 1px 10px rgba(12, 2, 30, 0.85);
+  will-change: transform, opacity;
+}
+
+/* ── Chapters ──────────────────────────────────────────────────────────────
+   Each chapter is one viewport tall and scrolls over the fixed stage. Its
+   --px / --py / --ph are the prism's place and height while it is on screen,
+   as percentages of the stage. */
+
+.chapters {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.chapters a,
+.chapters button {
+  pointer-events: auto;
+}
+
+.chapter {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  align-items: flex-start;
+  padding: max(40px, env(safe-area-inset-top)) var(--pad)
+    max(16px, env(safe-area-inset-bottom));
+  /* Stacked defaults: prism below the copy, centred. */
+  --px: 50;
+  --py: 62;
+  --ph: 32;
+}
+
+.chapter-hero {
+  padding: 0;
+  --px: 50;
+  --py: 62;
+  --ph: 32;
+}
+
+.chapter-grid {
+  --py: 56;
+  --ph: 24;
+}
+
+/* The shadow reaches to the right of the prism, and the second triangle
+   further still, so the prism itself sits left of centre here. */
+.chapter-shadow,
+.chapter-ribbons {
+  --px: 46;
+  --py: 58;
+  --ph: 22;
+}
+
+/* The ribbon stack and its label column are wider than the prism, so on narrow
+   screens the pivot moves left and the solid shrinks. */
+.chapter-sliver {
+  --px: 40;
+  --py: 56;
+  --ph: 24;
+}
+
+/* Scroll length for the last chapter's stage; carries no anchor of its own. */
+.chapter-tail {
+  min-height: 100vh;
+  min-height: 100svh;
+}
+
+.chapter-copy {
+  max-width: 34ch;
+}
+
+.chapter-right .chapter-copy {
+  margin-left: auto;
+}
+
+.chapter-eyebrow {
+  width: fit-content;
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.chapter-title {
+  margin: 0 0 12px;
+  font-size: clamp(24px, 6vw, 38px);
+  line-height: 1.16;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+
+.chapter-body {
+  margin: 0;
+  font-size: clamp(14px, 3.6vw, 17px);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* ── Hero chapter ──────────────────────────────────────────────────────── */
+
+.hero-ui {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 100svh;
+  padding: max(40px, env(safe-area-inset-top)) var(--pad)
+    max(10px, env(safe-area-inset-bottom));
+}
+
+.hero-copy {
+  flex: 0 0 auto;
+}
+
+.hero-eyebrow {
+  width: fit-content;
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero-title {
+  margin: 0 0 14px;
+  font-size: clamp(28px, 7.4vw, 46px);
+  line-height: 1.14;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+
+.hero-title-line {
+  display: inline;
+}
+
+.hero-body p {
+  max-width: 40em;
+  margin: 0 0 12px;
+  font-size: clamp(14px, 3.6vw, 17px);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.hero-body p:last-child {
+  margin-bottom: 0;
+}
+
+.hero-cta-row {
+  margin-top: 20px;
+}
+
+.hero-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 22px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: linear-gradient(var(--bg), var(--bg)) padding-box,
+    var(--cta-gradient) border-box;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.hero-cta:hover {
+  transform: translateY(-1px);
+}
+
+.hero-cta:focus-visible {
+  outline: 2px solid #01f4b1;
+  outline-offset: 3px;
+}
+
+.hero-cta svg {
+  width: 1.15em;
+  height: 1.15em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.hero-stats {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: auto 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hero-stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.hero-stat-value {
+  width: fit-content;
+  font-size: clamp(22px, 6vw, 34px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero-stat-label {
+  margin-top: 4px;
+  font-size: clamp(10.5px, 2.8vw, 14px);
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.hero-stat-label span {
+  display: block;
+}
+
+@media (max-width: 599px) {
+  .hero-body p + p {
+    display: none;
+  }
+}
+
+/* ── Scroll hint ───────────────────────────────────────────────────────── */
+
+.scroll-hint {
+  flex: 0 0 auto;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  pointer-events: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: rgba(200, 188, 255, 0.9);
+  will-change: opacity;
+  animation: hintPulse 2s ease-in-out infinite;
+}
+
+.scroll-hint-arrow {
+  width: 1px;
+  height: 26px;
+  background: linear-gradient(to bottom, transparent, rgba(200, 188, 255, 0.95));
+  animation: arrowPulse 2s ease-in-out infinite;
+}
+
+@keyframes hintPulse {
+  0%,
+  100% {
+    filter: opacity(0.55);
+  }
+  50% {
+    filter: opacity(1);
+  }
+}
+
+@keyframes arrowPulse {
+  0% {
+    opacity: 0.3;
+    transform: scaleY(0.6) translateY(-8px);
+  }
+  100% {
+    opacity: 0.8;
+    transform: scaleY(1) translateY(0);
+  }
+}
+
+/* ── Desktop and landscape tablets ─────────────────────────────────────────
+   The hero keeps the design's column layout; later chapters put their copy on
+   one side and the prism on the other. Type is capped by viewport height as
+   well as width, so short windows shrink the text instead of overlapping. */
+
+@media (min-width: 1024px) and (min-aspect-ratio: 6/5) {
+  .chapter {
+    align-items: center;
+  }
+
+  .chapter-copy {
+    max-width: 38ch;
+    padding-left: calc(var(--col) * 0.49);
+  }
+
+  .chapter-right .chapter-copy {
+    padding-right: calc(var(--col) * 0.49);
+    padding-left: 0;
+  }
+
+  .chapter-eyebrow {
+    font-size: clamp(11px, 0.85cqw, 16px);
+  }
+
+  .chapter-title {
+    font-size: clamp(26px, min(2.6cqw, 5.6svh), 48px);
+  }
+
+  .chapter-body {
+    font-size: clamp(13px, min(1.08cqw, 2.5svh), 20px);
+    line-height: 1.75;
+  }
+
+  /* Prism anchors, chapter by chapter (see lib/chapters.js). */
+
+  .chapter-hero {
+    --px: 72;
+    --py: 60;
+    --ph: 58;
+  }
+
+  .chapter-section {
+    --px: 68;
+    --py: 52;
+    --ph: 56;
+  }
+
+  .chapter-cut {
+    --px: 62;
+    --py: 52;
+    --ph: 60;
+  }
+
+  /* Zoomed out: the prism is small and central so the grid reads. */
+  .chapter-grid {
+    --px: 50;
+    --py: 48;
+    --ph: 34;
+  }
+
+  /* The cast shadow runs right and back from the prism, so the solid moves
+     left of the copy's column to leave the shadow its room. */
+  .chapter-shadow {
+    --px: 44;
+    --py: 44;
+    --ph: 38;
+  }
+
+  /* The pair of shadows spreads either side of the prism, so it is centred. */
+  .chapter-ribbons {
+    --px: 38;
+    --py: 46;
+    --ph: 36;
+  }
+
+  /* The ribbon stack and its labels are centred on the prism's pivot. */
+  .chapter-sliver {
+    --px: 56;
+    --py: 48;
+    --ph: 40;
+  }
+
+  /* Hero chapter layout: the design's column grid. */
+
+  .hero-ui {
+    display: grid;
+    grid-template-columns: repeat(11, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1fr) min(var(--col), 16svh);
+    padding: 0;
+  }
+
+  .hero-copy {
+    grid-column: 2 / 9;
+    grid-row: 1;
+    align-self: center;
+    padding-left: calc(var(--col) * 0.49);
+  }
+
+  .hero-eyebrow {
+    margin-bottom: clamp(14px, min(1.8cqw, 3.6svh), 40px);
+    font-size: clamp(11px, 0.85cqw, 16px);
+  }
+
+  .hero-title {
+    margin-bottom: clamp(10px, min(0.9cqw, 1.8svh), 22px);
+    font-size: clamp(30px, min(3.55cqw, 7.8svh), 70px);
+    line-height: 1.13;
+  }
+
+  .hero-title-line {
+    display: block;
+  }
+
+  .hero-body p {
+    max-width: 44cqw;
+    margin-bottom: 1.9em;
+    font-size: clamp(13px, min(1.08cqw, 2.5svh), 21px);
+    line-height: 1.9;
+  }
+
+  .hero-cta-row {
+    margin-top: clamp(20px, min(3.4cqw, 6svh), 80px);
+  }
+
+  .hero-cta {
+    height: clamp(42px, min(3.18cqw, 7svh), 60px);
+    padding: 0 clamp(20px, 1.65cqw, 32px);
+    font-size: clamp(14px, 1.02cqw, 19px);
+  }
+
+  .hero-stats {
+    grid-column: 10 / 12;
+    grid-row: 1;
+    align-self: start;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(16px, min(3.3cqw, 6svh), 64px);
+    margin: 0;
+    padding: clamp(20px, min(2.84cqw, 5svh), 56px) 0 0 clamp(18px, 2.8cqw, 54px);
+  }
+
+  .hero-stat-value {
+    font-size: clamp(26px, min(3.18cqw, 7svh), 62px);
+  }
+
+  .hero-stat-label {
+    margin-top: clamp(4px, min(0.6cqw, 1.2svh), 12px);
+    font-size: clamp(12px, min(1.19cqw, 2.7svh), 22px);
+    line-height: 1.33;
+  }
+
+  .scroll-hint {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    align-self: center;
+    justify-self: center;
+    gap: clamp(6px, 0.6cqw, 12px);
+    margin: 0;
+    font-size: clamp(11px, 0.72cqw, 14px);
+  }
+
+  .scroll-hint-arrow {
+    height: clamp(22px, min(2.4cqw, 5svh), 44px);
+  }
+}
+
+/* ── WebGL fallback ────────────────────────────────────────────────────────
+   Drawn in the fixed stage at the hero's anchor. */
+
+.webgl-fallback {
+  position: absolute;
+  left: 50%;
+  top: 62%;
+  height: 32%;
+  aspect-ratio: 0.83;
+  transform: translate(-50%, -50%);
+  clip-path: polygon(50% 0%, 100% 90%, 47% 100%, 0% 88%);
+  background: linear-gradient(
+    160deg,
+    #f2f0ff 0%,
+    #b9b4d6 30%,
+    #6f6a94 55%,
+    #d8b48c 78%,
+    #9ad1c2 100%
+  );
+}
+
+@media (min-width: 1024px) and (min-aspect-ratio: 6/5) {
+  .webgl-fallback {
+    left: 72%;
+    top: 60%;
+    height: 58%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-hint,
+  .scroll-hint-arrow {
+    animation: none;
+  }
+
+  .hero-cta {
+    transition: none;
+  }
+}
